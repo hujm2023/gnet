@@ -24,6 +24,7 @@ import (
 
 	"github.com/panjf2000/gnet/v2/internal/netpoll"
 	errorx "github.com/panjf2000/gnet/v2/pkg/errors"
+	"github.com/panjf2000/gnet/v2/pkg/logging"
 )
 
 func (el *eventloop) rotate() error {
@@ -50,6 +51,8 @@ func (el *eventloop) orbit() error {
 		runtime.LockOSThread()
 		defer runtime.UnlockOSThread()
 	}
+
+	logging.Infof("[gnet_eventloop_orbit] eventloop[%d] start polling...", el.idx)
 
 	err := el.poller.Polling(func(fd int, ev netpoll.IOEvent, flags netpoll.IOFlags) error {
 		c := el.connections.getConn(fd)
@@ -83,6 +86,8 @@ func (el *eventloop) run() error {
 		runtime.LockOSThread()
 		defer runtime.UnlockOSThread()
 	}
+
+	logging.Infof("[gnet_eventloop_run] eventloop[%d] start polling...", el.idx)
 
 	err := el.poller.Polling(func(fd int, ev netpoll.IOEvent, flags netpoll.IOFlags) error {
 		c := el.connections.getConn(fd)
