@@ -21,6 +21,7 @@ import (
 	"context"
 	"errors"
 	"net"
+	"runtime"
 	"strconv"
 	"sync"
 	"syscall"
@@ -28,6 +29,7 @@ import (
 	"golang.org/x/sync/errgroup"
 	"golang.org/x/sys/unix"
 
+	"github.com/panjf2000/gnet/v2/internal/gfd"
 	"github.com/panjf2000/gnet/v2/internal/math"
 	"github.com/panjf2000/gnet/v2/internal/netpoll"
 	"github.com/panjf2000/gnet/v2/internal/queue"
@@ -61,16 +63,12 @@ func NewClient(eh EventHandler, opts ...Option) (cli *Client, err error) {
 	}
 	logging.SetDefaultLoggerAndFlusher(logger, logFlusher)
 
-	var p *netpoll.Poller
-	if p, err = netpoll.OpenPoller(); err != nil {
-		return
-	}
-
 	shutdownCtx, shutdown := context.WithCancel(context.Background())
 	eng := engine{
 		listeners:    make(map[int]*listener),
 		opts:         options,
 		eventHandler: eh,
+		eventLoops:   new(roundRobinLoadBalancer),
 		workerPool: struct {
 			*errgroup.Group
 			shutdownCtx context.Context
@@ -80,6 +78,11 @@ func NewClient(eh EventHandler, opts ...Option) (cli *Client, err error) {
 	}
 	if options.Ticker {
 		eng.ticker.ctx, eng.ticker.cancel = context.WithCancel(context.Background())
+	}
+
+	var p *netpoll.Poller
+	if p, err = netpoll.OpenPoller(); err != nil {
+		return
 	}
 	el := eventloop{
 		listeners: eng.listeners,
@@ -106,6 +109,33 @@ func NewClient(eh EventHandler, opts ...Option) (cli *Client, err error) {
 		options.WriteBufferCap = math.CeilToPowerOfTwo(wbc)
 	}
 
+	numEventLoop := 10
+	if options.Multicore {
+		numEventLoop = runtime.NumCPU()
+	}
+	if options.NumEventLoop > 0 {
+		numEventLoop = options.NumEventLoop
+	}
+	if numEventLoop > gfd.EventLoopIndexMax {
+		numEventLoop = gfd.EventLoopIndexMax
+	}
+
+	for i := 0; i < numEventLoop; i++ {
+		p, err := netpoll.OpenPoller()
+		if err != nil {
+			return nil, err
+		}
+		el := new(eventloop)
+		el.listeners = eng.listeners
+		el.idx = i
+		el.engine = &eng
+		el.poller = p
+		el.buffer = make([]byte, options.ReadBufferCap)
+		el.connections.init()
+		el.eventHandler = eh
+		eng.eventLoops.register(el)
+	}
+
 	el.buffer = make([]byte, options.ReadBufferCap)
 	el.connections.init()
 	el.eventHandler = eh
@@ -117,6 +147,12 @@ func NewClient(eh EventHandler, opts ...Option) (cli *Client, err error) {
 func (cli *Client) Start() error {
 	logging.Infof("Starting gnet client with 1 event-loop")
 	cli.el.eventHandler.OnBoot(Engine{cli.el.engine})
+
+	cli.el.engine.eventLoops.iterate(func(_ int, e *eventloop) bool {
+		cli.el.engine.workerPool.Go(e.orbit)
+		return true
+	})
+
 	cli.el.engine.workerPool.Go(cli.el.run)
 	// Start the ticker.
 	if cli.opts.Ticker {
@@ -128,13 +164,27 @@ func (cli *Client) Start() error {
 
 // Stop stops the client event-loop.
 func (cli *Client) Stop() (err error) {
+	// Stop all pollers.
+	cli.el.engine.eventLoops.iterate(func(_ int, e *eventloop) bool {
+		e.poller.Trigger(queue.HighPriority, func(_ interface{}) error { return errorx.ErrEngineShutdown }, nil)
+		return true
+	})
 	logging.Error(cli.el.poller.Trigger(queue.HighPriority, func(_ interface{}) error { return errorx.ErrEngineShutdown }, nil))
+
 	// Stop the ticker.
 	if cli.opts.Ticker {
 		cli.el.engine.ticker.cancel()
 	}
+
 	_ = cli.el.engine.workerPool.Wait()
+
+	// Close all pollers.
+	cli.el.engine.eventLoops.iterate(func(_ int, e *eventloop) bool {
+		logging.Error(e.poller.Close())
+		return true
+	})
 	logging.Error(cli.el.poller.Close())
+
 	cli.el.eventHandler.OnShutdown(Engine{cli.el.engine})
 	logging.Cleanup()
 	return
@@ -235,7 +285,12 @@ func (cli *Client) EnrollContext(c net.Conn, ctx interface{}) (Conn, error) {
 	ccb := &connWithCallback{c: gc, cb: func() {
 		close(connOpened)
 	}}
-	err = cli.el.poller.Trigger(queue.HighPriority, cli.el.register, ccb)
+
+	// choose an eventLoop by sockAddr and register this conn to it.
+	remoteAddr := socket.SockaddrToTCPOrUnixAddr(sockAddr)
+	el := cli.el.engine.eventLoops.next(remoteAddr)
+	// err = cli.el.poller.Trigger(queue.HighPriority, cli.el.register, ccb)
+	err = el.poller.Trigger(queue.HighPriority, el.register, ccb)
 	if err != nil {
 		gc.Close()
 		return nil, err
